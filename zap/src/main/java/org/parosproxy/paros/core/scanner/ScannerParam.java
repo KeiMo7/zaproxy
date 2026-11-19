@@ -64,8 +64,10 @@ package org.parosproxy.paros.core.scanner;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.apache.commons.configuration.ConversionException;
 import org.apache.commons.configuration.HierarchicalConfiguration;
 import org.apache.logging.log4j.LogManager;
@@ -148,6 +150,28 @@ public class ScannerParam extends AbstractParam {
 
     private static final String PERSIST_TEMPORARY_MESSAGES =
             ACTIVE_SCAN_BASE_KEY + ".persistTemporaryMessages";
+
+    static final String REQUEST_DEDUPLICATION_ENABLED =
+            ACTIVE_SCAN_BASE_KEY + ".requestDeduplication.enabled";
+    static final String REQUEST_DEDUPLICATION_PERSIST =
+            ACTIVE_SCAN_BASE_KEY + ".requestDeduplication.persist";
+    static final String REQUEST_DEDUPLICATION_MAX_ENTRIES =
+            ACTIVE_SCAN_BASE_KEY + ".requestDeduplication.maxEntries";
+    static final String REQUEST_DEDUPLICATION_MAX_BYTES =
+            ACTIVE_SCAN_BASE_KEY + ".requestDeduplication.maxBytes";
+    static final String REQUEST_DEDUPLICATION_TTL_IN_SECONDS =
+            ACTIVE_SCAN_BASE_KEY + ".requestDeduplication.ttlInSeconds";
+    static final String REQUEST_DEDUPLICATION_STRUCTURE_CHANGE_THRESHOLD =
+            ACTIVE_SCAN_BASE_KEY + ".requestDeduplication.structureChangeThreshold";
+    static final String REQUEST_DEDUPLICATION_CACHE_FILE =
+            ACTIVE_SCAN_BASE_KEY + ".requestDeduplication.cacheFile";
+    static final String REQUEST_DEDUPLICATION_DISABLED_PLUGINS =
+            ACTIVE_SCAN_BASE_KEY + ".requestDeduplication.disabledPlugins";
+
+    private static final int DEFAULT_REQUEST_DEDUPLICATION_MAX_ENTRIES = 100_000;
+    private static final long DEFAULT_REQUEST_DEDUPLICATION_MAX_BYTES = 64L * 1024 * 1024;
+    private static final long DEFAULT_REQUEST_DEDUPLICATION_TTL_IN_SECONDS = 24 * 60 * 60;
+    private static final double DEFAULT_REQUEST_DEDUPLICATION_STRUCTURE_CHANGE_THRESHOLD = 0.25;
 
     // ZAP: Configuration constants
     public static final int TARGET_QUERYSTRING = 1;
@@ -244,6 +268,16 @@ public class ScannerParam extends AbstractParam {
     private static final Logger LOGGER = LogManager.getLogger(ScannerParam.class);
 
     private boolean persistTemporaryMessages;
+
+    private boolean requestDeduplicationEnabled = true;
+    private boolean requestDeduplicationPersist = true;
+    private int requestDeduplicationMaxEntries = DEFAULT_REQUEST_DEDUPLICATION_MAX_ENTRIES;
+    private long requestDeduplicationMaxBytes = DEFAULT_REQUEST_DEDUPLICATION_MAX_BYTES;
+    private long requestDeduplicationTtlInSeconds = DEFAULT_REQUEST_DEDUPLICATION_TTL_IN_SECONDS;
+    private double requestDeduplicationStructureChangeThreshold =
+            DEFAULT_REQUEST_DEDUPLICATION_STRUCTURE_CHANGE_THRESHOLD;
+    private String requestDeduplicationCacheFile;
+    private final Set<Integer> requestDeduplicationDisabledPlugins = new HashSet<>();
 
     public ScannerParam() {}
 
@@ -349,6 +383,53 @@ public class ScannerParam extends AbstractParam {
                 getBoolean(
                         PERSIST_TEMPORARY_MESSAGES,
                         ZAP.getProcessType() == ZAP.ProcessType.desktop);
+
+        requestDeduplicationEnabled = getBoolean(REQUEST_DEDUPLICATION_ENABLED, true);
+        requestDeduplicationPersist = getBoolean(REQUEST_DEDUPLICATION_PERSIST, true);
+        requestDeduplicationMaxEntries =
+                Math.max(
+                        1,
+                        getInt(
+                                REQUEST_DEDUPLICATION_MAX_ENTRIES,
+                                DEFAULT_REQUEST_DEDUPLICATION_MAX_ENTRIES));
+        requestDeduplicationMaxBytes =
+                Math.max(
+                        1,
+                        getLongConfig(
+                                REQUEST_DEDUPLICATION_MAX_BYTES,
+                                DEFAULT_REQUEST_DEDUPLICATION_MAX_BYTES));
+        requestDeduplicationTtlInSeconds =
+                Math.max(
+                        1,
+                        getLongConfig(
+                                REQUEST_DEDUPLICATION_TTL_IN_SECONDS,
+                                DEFAULT_REQUEST_DEDUPLICATION_TTL_IN_SECONDS));
+        requestDeduplicationStructureChangeThreshold =
+                Math.max(
+                        0,
+                        Math.min(
+                                1,
+                                getDoubleConfig(
+                                        REQUEST_DEDUPLICATION_STRUCTURE_CHANGE_THRESHOLD,
+                                        DEFAULT_REQUEST_DEDUPLICATION_STRUCTURE_CHANGE_THRESHOLD)));
+        requestDeduplicationCacheFile = getString(REQUEST_DEDUPLICATION_CACHE_FILE, "").trim();
+
+        requestDeduplicationDisabledPlugins.clear();
+        String disabledPlugins = getString(REQUEST_DEDUPLICATION_DISABLED_PLUGINS, "");
+        for (String pluginId : disabledPlugins.split(",")) {
+            String value = pluginId.trim();
+            if (value.isEmpty()) {
+                continue;
+            }
+            try {
+                requestDeduplicationDisabledPlugins.add(Integer.parseInt(value));
+            } catch (NumberFormatException e) {
+                LOGGER.warn(
+                        "Ignoring invalid plugin ID in {}: {}",
+                        REQUEST_DEDUPLICATION_DISABLED_PLUGINS,
+                        value);
+            }
+        }
     }
 
     private void migrateOldOptions() {
@@ -819,5 +900,149 @@ public class ScannerParam extends AbstractParam {
 
         this.persistTemporaryMessages = value;
         getConfig().setProperty(PERSIST_TEMPORARY_MESSAGES, this.persistTemporaryMessages);
+    }
+
+    /**
+     * Tells whether or not request response deduplication is enabled.
+     *
+     * @return {@code true} if request deduplication is enabled.
+     * @since 2.18.0
+     */
+    public boolean isRequestDeduplicationEnabled() {
+        return requestDeduplicationEnabled;
+    }
+
+    /**
+     * Sets whether or not request response deduplication is enabled.
+     *
+     * @param enabled {@code true} if request deduplication should be enabled.
+     * @since 2.18.0
+     */
+    public void setRequestDeduplicationEnabled(boolean enabled) {
+        requestDeduplicationEnabled = enabled;
+        getConfig().setProperty(REQUEST_DEDUPLICATION_ENABLED, enabled);
+    }
+
+    /**
+     * Tells whether or not the request deduplication index should be persisted between scans.
+     *
+     * @return {@code true} if the index should be persisted.
+     * @since 2.18.0
+     */
+    public boolean isRequestDeduplicationPersist() {
+        return requestDeduplicationPersist;
+    }
+
+    /**
+     * Sets whether or not the request deduplication index should be persisted between scans.
+     *
+     * @param persist {@code true} if the index should be persisted.
+     * @since 2.18.0
+     */
+    public void setRequestDeduplicationPersist(boolean persist) {
+        requestDeduplicationPersist = persist;
+        getConfig().setProperty(REQUEST_DEDUPLICATION_PERSIST, persist);
+    }
+
+    public int getRequestDeduplicationMaxEntries() {
+        return requestDeduplicationMaxEntries;
+    }
+
+    public void setRequestDeduplicationMaxEntries(int maxEntries) {
+        requestDeduplicationMaxEntries = Math.max(1, maxEntries);
+        getConfig().setProperty(REQUEST_DEDUPLICATION_MAX_ENTRIES, requestDeduplicationMaxEntries);
+    }
+
+    public long getRequestDeduplicationMaxBytes() {
+        return requestDeduplicationMaxBytes;
+    }
+
+    public void setRequestDeduplicationMaxBytes(long maxBytes) {
+        requestDeduplicationMaxBytes = Math.max(1, maxBytes);
+        getConfig().setProperty(REQUEST_DEDUPLICATION_MAX_BYTES, requestDeduplicationMaxBytes);
+    }
+
+    public long getRequestDeduplicationTtlInSeconds() {
+        return requestDeduplicationTtlInSeconds;
+    }
+
+    public void setRequestDeduplicationTtlInSeconds(long ttlInSeconds) {
+        requestDeduplicationTtlInSeconds = Math.max(1, ttlInSeconds);
+        getConfig()
+                .setProperty(
+                        REQUEST_DEDUPLICATION_TTL_IN_SECONDS, requestDeduplicationTtlInSeconds);
+    }
+
+    public double getRequestDeduplicationStructureChangeThreshold() {
+        return requestDeduplicationStructureChangeThreshold;
+    }
+
+    public void setRequestDeduplicationStructureChangeThreshold(double threshold) {
+        requestDeduplicationStructureChangeThreshold = Math.max(0, Math.min(1, threshold));
+        getConfig()
+                .setProperty(
+                        REQUEST_DEDUPLICATION_STRUCTURE_CHANGE_THRESHOLD,
+                        requestDeduplicationStructureChangeThreshold);
+    }
+
+    /**
+     * Gets the configured cache file or an empty string to use the default location.
+     *
+     * @return the cache file path, possibly empty.
+     * @since 2.18.0
+     */
+    public String getRequestDeduplicationCacheFile() {
+        return requestDeduplicationCacheFile;
+    }
+
+    public void setRequestDeduplicationCacheFile(String cacheFile) {
+        requestDeduplicationCacheFile = cacheFile == null ? "" : cacheFile.trim();
+        getConfig().setProperty(REQUEST_DEDUPLICATION_CACHE_FILE, requestDeduplicationCacheFile);
+    }
+
+    /**
+     * Tells whether request deduplication is enabled for the given plugin.
+     *
+     * @param plugin the plugin.
+     * @return {@code true} if request deduplication is enabled for the plugin.
+     * @since 2.18.0
+     */
+    public boolean isRequestDeduplicationEnabledForPlugin(Plugin plugin) {
+        return requestDeduplicationEnabled
+                && !requestDeduplicationDisabledPlugins.contains(plugin.getId())
+                && plugin.isRequestDeduplicationEnabled();
+    }
+
+    /**
+     * Creates a cache configuration from these parameters.
+     *
+     * @return the cache configuration.
+     * @since 2.18.0
+     */
+    @ZapApiIgnore
+    public RequestDeduplicationCache.Config getRequestDeduplicationCacheConfig() {
+        return new RequestDeduplicationCache.Config(
+                requestDeduplicationMaxEntries,
+                requestDeduplicationMaxBytes,
+                java.util.concurrent.TimeUnit.SECONDS.toMillis(requestDeduplicationTtlInSeconds),
+                requestDeduplicationStructureChangeThreshold);
+    }
+
+    private long getLongConfig(String key, long defaultValue) {
+        try {
+            return getConfig().getLong(key, defaultValue);
+        } catch (ConversionException e) {
+            logConversionException(key, e);
+        }
+        return defaultValue;
+    }
+
+    private double getDoubleConfig(String key, double defaultValue) {
+        try {
+            return getConfig().getDouble(key, defaultValue);
+        } catch (ConversionException e) {
+            logConversionException(key, e);
+        }
+        return defaultValue;
     }
 }

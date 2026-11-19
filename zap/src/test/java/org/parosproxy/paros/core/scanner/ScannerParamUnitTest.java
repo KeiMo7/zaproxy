@@ -25,6 +25,7 @@ import static org.hamcrest.Matchers.is;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.Mockito.mock;
 
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -193,6 +194,84 @@ class ScannerParamUnitTest {
         // Then
         assertThat(
                 configuration.getBoolean(ScannerParam.SCAN_NULL_JSON_VALUES), is(equalTo(value)));
+    }
+
+    @Test
+    void shouldEnableRequestDeduplicationByDefault() {
+        // Given / When
+        boolean enabled = param.isRequestDeduplicationEnabled();
+        // Then
+        assertThat(enabled, is(equalTo(true)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void shouldSetRequestDeduplicationEnabled(boolean value) {
+        // Given / When
+        param.setRequestDeduplicationEnabled(value);
+        // Then
+        assertThat(param.isRequestDeduplicationEnabled(), is(equalTo(value)));
+        assertThat(
+                configuration.getBoolean(ScannerParam.REQUEST_DEDUPLICATION_ENABLED),
+                is(equalTo(value)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2, 100_000})
+    void shouldLoadRequestDeduplicationMaxEntries(int maxEntries) {
+        // Given
+        configuration.setProperty(ScannerParam.REQUEST_DEDUPLICATION_MAX_ENTRIES, maxEntries);
+        // When
+        param.load(configuration);
+        // Then
+        assertThat(param.getRequestDeduplicationMaxEntries(), is(equalTo(maxEntries)));
+    }
+
+    @Test
+    void shouldUseOneForInvalidRequestDeduplicationMaxEntries() {
+        // Given
+        configuration.setProperty(ScannerParam.REQUEST_DEDUPLICATION_MAX_ENTRIES, 0);
+        // When
+        param.load(configuration);
+        // Then
+        assertThat(param.getRequestDeduplicationMaxEntries(), is(equalTo(1)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {1, 1024, 64 * 1024 * 1024L})
+    void shouldLoadRequestDeduplicationMaxBytes(long maxBytes) {
+        // Given
+        configuration.setProperty(ScannerParam.REQUEST_DEDUPLICATION_MAX_BYTES, maxBytes);
+        // When
+        param.load(configuration);
+        // Then
+        assertThat(param.getRequestDeduplicationMaxBytes(), is(equalTo(maxBytes)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {1, 60, 24 * 60 * 60L})
+    void shouldLoadRequestDeduplicationTtl(long ttlInSeconds) {
+        // Given
+        configuration.setProperty(ScannerParam.REQUEST_DEDUPLICATION_TTL_IN_SECONDS, ttlInSeconds);
+        // When
+        param.load(configuration);
+        // Then
+        assertThat(param.getRequestDeduplicationTtlInSeconds(), is(equalTo(ttlInSeconds)));
+        assertThat(
+                param.getRequestDeduplicationCacheConfig().getTtlMillis(),
+                is(equalTo(TimeUnit.SECONDS.toMillis(ttlInSeconds))));
+    }
+
+    @Test
+    void shouldDisableRequestDeduplicationForConfiguredPlugin() {
+        // Given
+        configuration.setProperty(ScannerParam.REQUEST_DEDUPLICATION_DISABLED_PLUGINS, "1, 42");
+        param.load(configuration);
+        Plugin plugin = mock(Plugin.class);
+        org.mockito.BDDMockito.given(plugin.getId()).willReturn(42);
+        org.mockito.BDDMockito.given(plugin.isRequestDeduplicationEnabled()).willReturn(true);
+        // When / Then
+        assertThat(param.isRequestDeduplicationEnabledForPlugin(plugin), is(equalTo(false)));
     }
 
     @ParameterizedTest

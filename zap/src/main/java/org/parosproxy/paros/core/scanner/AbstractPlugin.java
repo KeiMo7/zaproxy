@@ -107,10 +107,12 @@ import org.zaproxy.zap.extension.anticsrf.ExtensionAntiCSRF;
 import org.zaproxy.zap.extension.custompages.CustomPage;
 import org.zaproxy.zap.model.Tech;
 import org.zaproxy.zap.model.TechSet;
+import org.zaproxy.zap.users.User;
 
 public abstract class AbstractPlugin implements Plugin, Comparable<Object> {
 
     private static final String[] NO_DEPENDENCIES = {};
+    private static final String REQUEST_DEDUPLICATION_ENABLED_KEY = "requestDeduplication.enabled";
 
     /** Default pattern used in pattern check for most plugins. */
     protected static final int PATTERN_PARAM = Pattern.CASE_INSENSITIVE | Pattern.MULTILINE;
@@ -137,6 +139,7 @@ public abstract class AbstractPlugin implements Plugin, Comparable<Object> {
     private Date started = null;
     private Date finished = null;
     private AddOn.Status status = AddOn.Status.unknown;
+    private boolean requestDeduplicationEnabled = true;
 
     /** Default Constructor */
     public AbstractPlugin() {
@@ -151,6 +154,19 @@ public abstract class AbstractPlugin implements Plugin, Comparable<Object> {
             result = result.substring(pos + 1);
         }
         return result;
+    }
+
+    @Override
+    public boolean isRequestDeduplicationEnabled() {
+        return requestDeduplicationEnabled;
+    }
+
+    @Override
+    public void setRequestDeduplicationEnabled(boolean enabled) {
+        requestDeduplicationEnabled = enabled;
+        if (config != null) {
+            setProperty(REQUEST_DEDUPLICATION_ENABLED_KEY, Boolean.toString(enabled));
+        }
     }
 
     /**
@@ -310,6 +326,7 @@ public abstract class AbstractPlugin implements Plugin, Comparable<Object> {
         parent.performScannerHookBeforeScan(message, this);
 
         boolean send = true;
+        boolean requestSent = true;
         if (parent.handleAntiCsrfTokens() && handleAntiCSRF) {
             if (extAntiCSRF == null) {
                 extAntiCSRF =
@@ -328,23 +345,79 @@ public abstract class AbstractPlugin implements Plugin, Comparable<Object> {
         }
 
         if (send) {
-            sendMessageImpl(message, isFollowRedirect);
+            requestSent = sendMessageImpl(message, isFollowRedirect);
         }
 
         decodeResponseBody(message);
         // ZAP: Notify parent
-        parent.notifyNewMessage(this, message);
+        parent.notifyNewMessage(this, message, requestSent);
 
         // ZAP: Set the history reference back and run the "afterScan" methods of any ScannerHooks
         parent.performScannerHookAfterScan(message, this);
     }
 
-    private void sendMessageImpl(HttpMessage message, boolean isFollowRedirect) throws IOException {
+    private boolean sendMessageImpl(HttpMessage message, boolean isFollowRedirect)
+            throws IOException {
+        RequestDeduplicationCache cache = parent.getRequestDeduplicationCache();
+        if (cache == null || !parent.isRequestDeduplicationEnabled(this)) {
+            sendDirect(message, isFollowRedirect);
+            notifySideEffectIfNeeded(message);
+            return true;
+        }
+
+        RequestDeduplicationKey key =
+                RequestDeduplicationKey.from(
+                        message, getRequestDeduplicationMode(), getRequestDeduplicationNamespace());
+        RequestDeduplicationCache.Result result =
+                cache.getOrSendResult(
+                        key,
+                        () -> {
+                            sendDirect(message, isFollowRedirect);
+                            return CachedHttpResponse.from(message);
+                        });
+        if (!result.isSent()) {
+            result.getResponse().applyTo(message);
+        } else {
+            notifySideEffectIfNeeded(message);
+        }
+        return result.isSent();
+    }
+
+    private String getRequestDeduplicationNamespace() {
+        String namespace = getRequestDeduplicationVariantNamespace();
+        if (getRequestDeduplicationMode() != RequestDeduplicationMode.STATELESS) {
+            User user = parent.getUser();
+            if (user != null && user.getName() != null) {
+                namespace += "\u0000scan-user:" + user.getName();
+            }
+        }
+        return namespace;
+    }
+
+    private void sendDirect(HttpMessage message, boolean isFollowRedirect) throws IOException {
         if (isFollowRedirect) {
             parent.getHttpSender().sendAndReceive(message, getParent().getRedirectRequestConfig());
         } else {
             parent.getHttpSender().sendAndReceive(message, false);
         }
+    }
+
+    private void notifySideEffectIfNeeded(HttpMessage message) {
+        if (isStateChangingRequest(message)) {
+            recordRequestSideEffect(message);
+        }
+    }
+
+    /**
+     * Records that the given request changed server state.
+     *
+     * <p>Shared responses for the same origin will be invalidated.
+     *
+     * @param message the request that changed server state.
+     * @since 2.18.0
+     */
+    protected void recordRequestSideEffect(HttpMessage message) {
+        parent.recordRequestSideEffect(this, message);
     }
 
     /**
@@ -1209,12 +1282,23 @@ public abstract class AbstractPlugin implements Plugin, Comparable<Object> {
         setProperty(conf, "enabled", Boolean.toString(enabled));
         setProperty(conf, "level", getProperty("level"));
         setProperty(conf, "strength", getProperty("strength"));
+        setProperty(
+                conf,
+                REQUEST_DEDUPLICATION_ENABLED_KEY,
+                Boolean.toString(requestDeduplicationEnabled));
     }
 
     @Override
     public void loadFrom(Configuration conf) {
         setProperty("level", getProperty(conf, "level"));
         setProperty("strength", getProperty(conf, "strength"));
+        String deduplicationEnabled = getProperty(conf, REQUEST_DEDUPLICATION_ENABLED_KEY);
+        if (deduplicationEnabled != null) {
+            requestDeduplicationEnabled = Boolean.parseBoolean(deduplicationEnabled);
+            setProperty(
+                    REQUEST_DEDUPLICATION_ENABLED_KEY,
+                    Boolean.toString(requestDeduplicationEnabled));
+        }
         String enabledProperty = getProperty(conf, "enabled");
         if (enabledProperty != null) {
             enabled = Boolean.parseBoolean(enabledProperty);

@@ -219,6 +219,65 @@ public interface Plugin extends Runnable, ExampleAlertProvider {
 
     void createParamIfNotExist();
 
+    /**
+     * Tells whether or not responses of identical requests may be shared for this plugin.
+     *
+     * <p>Deduplication is enabled by default. Plugins that intentionally send repeated requests,
+     * such as blind injection checks, can disable it.
+     *
+     * @return {@code true} if request deduplication is enabled for this plugin.
+     * @since 2.18.0
+     */
+    default boolean isRequestDeduplicationEnabled() {
+        return true;
+    }
+
+    /**
+     * Sets whether or not responses of identical requests may be shared for this plugin.
+     *
+     * @param enabled {@code true} if request deduplication should be enabled.
+     * @since 2.18.0
+     */
+    default void setRequestDeduplicationEnabled(boolean enabled) {}
+
+    /**
+     * Gets how authentication information is represented in request deduplication keys.
+     *
+     * @return the request deduplication mode.
+     * @since 2.18.0
+     */
+    default RequestDeduplicationMode getRequestDeduplicationMode() {
+        return RequestDeduplicationMode.AUTO;
+    }
+
+    /**
+     * Gets the variant namespace used in request deduplication keys.
+     *
+     * <p>Plugins can override this method when requests need to remain separate even when their
+     * wire representation is otherwise identical.
+     *
+     * @return the variant namespace, never {@code null}.
+     * @since 2.18.0
+     */
+    default String getRequestDeduplicationVariantNamespace() {
+        return "";
+    }
+
+    /**
+     * Tells whether the given request changes server state.
+     *
+     * <p>When this method returns {@code true} all shared responses for the request origin are
+     * invalidated. Plugins that create, update, or delete server state should override this method
+     * or call {@link AbstractPlugin#recordRequestSideEffect(HttpMessage)}.
+     *
+     * @param message the request that was sent.
+     * @return {@code true} if the request changed server state.
+     * @since 2.18.0
+     */
+    default boolean isStateChangingRequest(HttpMessage message) {
+        return false;
+    }
+
     // ZAP Added isDepreciated, getDelayInMs, setDelayInMs
     boolean isDepreciated();
 

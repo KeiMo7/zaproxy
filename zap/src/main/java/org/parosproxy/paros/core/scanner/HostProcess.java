@@ -192,6 +192,8 @@ public class HostProcess implements Runnable {
     /** New alerts found during the scan in the current session. */
     private int newAlertCount = 0;
 
+    private final Set<String> discoveredEndpointSignatures = new HashSet<>();
+
     /**
      * The ID of the message to be scanned by {@link AbstractHostPlugin}s.
      *
@@ -358,6 +360,7 @@ public class HostProcess implements Runnable {
 
         try {
             hostProcessStartTime = System.currentTimeMillis();
+            discoveredEndpointSignatures.clear();
 
             // Initialise plugin factory to report the state of the plugins ASAP.
             pluginFactory.reset();
@@ -374,6 +377,7 @@ public class HostProcess implements Runnable {
                         true,
                         node -> {
                             if (canScanNode(node)) {
+                                recordEndpointSignature(node);
                                 int nodeHistoryId = node.getHistoryReference().getHistoryId();
                                 if (node.getMethod().equals(HttpRequestHeader.GET)) {
                                     URI uri = node.getURI();
@@ -395,6 +399,7 @@ public class HostProcess implements Runnable {
                 getAnalyser().start(startNode);
             }
             nodeInScopeCount = messagesIdsToAppScan.size();
+            updateRequestDeduplicationStructure();
 
             if (!messagesIdsToAppScan.isEmpty()) {
                 messageIdToHostScan = messagesIdsToAppScan.get(0);
@@ -458,6 +463,34 @@ public class HostProcess implements Runnable {
 
         int getHistoryId() {
             return historyId;
+        }
+    }
+
+    private void recordEndpointSignature(StructuralNode node) {
+        try {
+            HttpMessage message = node.getHistoryReference().getHttpMessage();
+            if (message == null) {
+                return;
+            }
+            discoveredEndpointSignatures.add(RequestDeduplicationKey.endpointSignature(message));
+        } catch (HttpMalformedHeaderException | DatabaseException | RuntimeException e) {
+            LOGGER.debug(
+                    "Failed to create endpoint signature for {}: {}",
+                    node.getName(),
+                    e.getMessage());
+        }
+    }
+
+    private void updateRequestDeduplicationStructure() {
+        RequestDeduplicationCache cache = getRequestDeduplicationCache();
+        if (cache != null) {
+            double changeRatio = cache.updateStructure(hostAndPort, discoveredEndpointSignatures);
+            if (changeRatio > 0) {
+                LOGGER.info(
+                        "request deduplication structure change for {}: {}",
+                        hostAndPort,
+                        String.format("%.2f", changeRatio));
+            }
         }
     }
 
@@ -722,9 +755,30 @@ public class HostProcess implements Runnable {
         }
 
         try {
-            getHttpSender().sendAndReceive(message);
+            RequestDeduplicationCache cache = getRequestDeduplicationCache();
+            if (cache == null) {
+                getHttpSender().sendAndReceive(message);
+                requestCount++;
+            } else {
+                RequestDeduplicationCache.Result result =
+                        cache.getOrSendResult(
+                                RequestDeduplicationKey.from(
+                                        message,
+                                        RequestDeduplicationMode.AUTO,
+                                        user == null || user.getName() == null
+                                                ? ""
+                                                : "\u0000scan-user:" + user.getName()),
+                                () -> {
+                                    getHttpSender().sendAndReceive(message);
+                                    return CachedHttpResponse.from(message);
+                                });
+                if (!result.isSent()) {
+                    result.getResponse().applyTo(message);
+                } else {
+                    requestCount++;
+                }
+            }
             notifyNewMessage(message);
-            requestCount++;
             return true;
         } catch (IOException e) {
             LOGGER.warn(
@@ -875,11 +929,27 @@ public class HostProcess implements Runnable {
     private void notifyHostComplete() {
         long diffTimeMillis = System.currentTimeMillis() - hostProcessStartTime;
         String diffTimeString = decimalFormat.format(diffTimeMillis / 1000.0) + "s";
-        LOGGER.info(
-                "completed host {} in {} with {} alert(s) raised.",
-                hostAndPort,
-                diffTimeString,
-                getAlertCount());
+        RequestDeduplicationCache cache = getRequestDeduplicationCache();
+        if (cache != null) {
+            RequestDeduplicationStats stats = cache.getStats();
+            LOGGER.info(
+                    "completed host {} in {} with {} alert(s) raised, {} request(s), deduplication hits {}, hit rate {}, index {} entries/{} bytes.",
+                    hostAndPort,
+                    diffTimeString,
+                    getAlertCount(),
+                    getRequestCount(),
+                    stats.getDeduplicationHits(),
+                    String.format("%.2f", stats.getHitRate()),
+                    stats.getEntries(),
+                    stats.getEstimatedBytes());
+        } else {
+            LOGGER.info(
+                    "completed host {} in {} with {} alert(s) raised, {} request(s).",
+                    hostAndPort,
+                    diffTimeString,
+                    getAlertCount(),
+                    getRequestCount());
+        }
         parentScanner.notifyHostComplete(hostAndPort);
     }
 
@@ -906,8 +976,22 @@ public class HostProcess implements Runnable {
      * @see #notifyNewMessage(Plugin)
      */
     public void notifyNewMessage(Plugin plugin, HttpMessage message) {
+        notifyNewMessage(plugin, message, true);
+    }
+
+    /**
+     * Notifies that the given {@code plugin} obtained the given HTTP message.
+     *
+     * @param plugin the plugin that used the message
+     * @param message the HTTP message
+     * @param sent {@code true} if the request was sent to the target, {@code false} if a shared
+     *     response was used
+     */
+    void notifyNewMessage(Plugin plugin, HttpMessage message, boolean sent) {
         parentScanner.notifyNewMessage(message);
-        notifyNewMessage(plugin);
+        if (sent) {
+            notifyNewMessage(plugin);
+        }
     }
 
     /**
@@ -929,6 +1013,41 @@ public class HostProcess implements Runnable {
         PluginStats pluginStats = mapPluginStats.get(plugin.getId());
         if (pluginStats != null) {
             pluginStats.incMessageCount();
+        }
+    }
+
+    /**
+     * Gets the request deduplication cache used by the scan.
+     *
+     * @return the cache, or {@code null} if request deduplication is disabled.
+     * @since 2.18.0
+     */
+    public RequestDeduplicationCache getRequestDeduplicationCache() {
+        return parentScanner.getRequestDeduplicationCache();
+    }
+
+    /**
+     * Tells whether request deduplication is enabled for the given plugin.
+     *
+     * @param plugin the plugin.
+     * @return {@code true} if request deduplication is enabled for the plugin.
+     * @since 2.18.0
+     */
+    public boolean isRequestDeduplicationEnabled(Plugin plugin) {
+        return scannerParam != null && scannerParam.isRequestDeduplicationEnabledForPlugin(plugin);
+    }
+
+    /**
+     * Records that the given plugin changed server state.
+     *
+     * @param plugin the plugin that changed server state.
+     * @param message the request that changed server state.
+     * @since 2.18.0
+     */
+    public void recordRequestSideEffect(Plugin plugin, HttpMessage message) {
+        RequestDeduplicationCache cache = getRequestDeduplicationCache();
+        if (cache != null) {
+            cache.recordSideEffect(message, plugin.getRequestDeduplicationMode());
         }
     }
 
@@ -1240,6 +1359,16 @@ public class HostProcess implements Runnable {
         if (httpSender != null) {
             httpSender.setUser(user);
         }
+    }
+
+    /**
+     * Gets the user used by this scan.
+     *
+     * @return the user, or {@code null} if the scan is unauthenticated.
+     * @since 2.18.0
+     */
+    public User getUser() {
+        return user;
     }
 
     /**

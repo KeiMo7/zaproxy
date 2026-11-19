@@ -64,6 +64,9 @@
 // much.
 package org.parosproxy.paros.core.scanner;
 
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.security.InvalidParameterException;
 import java.text.DecimalFormat;
 import java.util.ArrayList;
@@ -140,6 +143,9 @@ public class Scanner implements Runnable {
     private boolean pause = false;
 
     private List<HostProcess> hostProcesses = new ArrayList<>();
+
+    private RequestDeduplicationCache requestDeduplicationCache;
+    private boolean requestDeduplicationCacheInitialised;
 
     /**
      * Constructs a {@code Scanner}, with no rules' configurations.
@@ -360,6 +366,85 @@ public class Scanner implements Runnable {
         return hostProcess;
     }
 
+    /**
+     * Gets the request deduplication cache used by this scan.
+     *
+     * @return the cache, or {@code null} if request deduplication is disabled.
+     * @since 2.18.0
+     */
+    public synchronized RequestDeduplicationCache getRequestDeduplicationCache() {
+        if (!requestDeduplicationCacheInitialised) {
+            requestDeduplicationCacheInitialised = true;
+            if (scannerParam.isRequestDeduplicationEnabled()) {
+                requestDeduplicationCache =
+                        new RequestDeduplicationCache(
+                                scannerParam.getRequestDeduplicationCacheConfig());
+                Path cacheFile = getRequestDeduplicationCacheFile();
+                if (cacheFile != null && scannerParam.isRequestDeduplicationPersist()) {
+                    try {
+                        requestDeduplicationCache.load(cacheFile);
+                    } catch (IOException e) {
+                        LOGGER.warn(
+                                "Failed to load request deduplication cache from {}: {}",
+                                cacheFile,
+                                e.getMessage());
+                    }
+                }
+            }
+        }
+        return requestDeduplicationCache;
+    }
+
+    /**
+     * Gets the current request deduplication statistics.
+     *
+     * @return the statistics, or {@code null} if request deduplication is disabled.
+     * @since 2.18.0
+     */
+    public RequestDeduplicationStats getRequestDeduplicationStats() {
+        RequestDeduplicationCache cache = getRequestDeduplicationCache();
+        return cache == null ? null : cache.getStats();
+    }
+
+    private Path getRequestDeduplicationCacheFile() {
+        String configuredFile = scannerParam.getRequestDeduplicationCacheFile();
+        if (configuredFile != null && !configuredFile.isEmpty()) {
+            return Paths.get(configuredFile);
+        }
+        String zapHome = Constant.getZapHome();
+        return zapHome == null || zapHome.isEmpty()
+                ? null
+                : Paths.get(zapHome, "request-dedup-cache.bin");
+    }
+
+    private void saveRequestDeduplicationCache() {
+        RequestDeduplicationCache cache = getRequestDeduplicationCache();
+        if (cache == null || !scannerParam.isRequestDeduplicationPersist()) {
+            return;
+        }
+        RequestDeduplicationStats stats = cache.getStats();
+        LOGGER.info(
+                "request deduplication: requests={}, hits={}, hitRate={}, sent={}, entries={}, estimatedBytes={}",
+                stats.getRequests(),
+                stats.getDeduplicationHits(),
+                String.format("%.2f", stats.getHitRate()),
+                stats.getMisses(),
+                stats.getEntries(),
+                stats.getEstimatedBytes());
+        Path cacheFile = getRequestDeduplicationCacheFile();
+        if (cacheFile == null) {
+            return;
+        }
+        try {
+            cache.save(cacheFile);
+        } catch (IOException e) {
+            LOGGER.warn(
+                    "Failed to save request deduplication cache to {}: {}",
+                    cacheFile,
+                    e.getMessage());
+        }
+    }
+
     public boolean isStop() {
 
         return isStop;
@@ -418,6 +503,7 @@ public class Scanner implements Runnable {
         long diffTimeMillis = System.currentTimeMillis() - startTimeMillis;
         String diffTimeString = decimalFormat.format(diffTimeMillis / 1000.0) + "s";
         LOGGER.info("scanner with ID {} completed in {}", id, diffTimeString);
+        saveRequestDeduplicationCache();
         isStop = true;
 
         ActiveScanEventPublisher.publishScanEvent(
